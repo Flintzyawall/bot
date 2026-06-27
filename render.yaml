@@ -17,3 +17,7 @@ services:
         value: https://api.telegram.org
       - key: TIMEOUT
         value: 60
+      - key: MEMORY_TIME_HOUR
+        value: 9
+      - key: MEMORY_TIME_MINUTE
+        value: 0
