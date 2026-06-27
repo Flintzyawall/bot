@@ -1304,7 +1304,7 @@ def main():
     logging.basicConfig(level=logging.INFO)
 
     print("=" * 50)
-    print("💕 БОТ-АЛЬБОМ ВОСПОМИНАНИЙ (python-telegram-bot)")
+    print("💕 БОТ-АЛЬБОМ ВОСПОМИНАНИЙ (python-telegram-bot v13.15)")
     print("=" * 50)
     print(f"📍 API сервер: {API_BASE}")
     if PROXY:
@@ -1315,39 +1315,24 @@ def main():
 
     ensure_folders()
 
-    # Создаем приложение
+    # Создаем приложение (синтаксис для v13.x)
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Регистрируем обработчики
+    # Регистрируем все обработчики (они совместимы)
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.add_handler(CallbackQueryHandler(handle_callback))
-    
-    # Обработчики для загрузки медиа
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media))
-    
-    # Обработчики для подписей
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_caption_text))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_memory_date_text))
-    
-    # Обработчики для аудио
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
 
     # Запускаем фоновую задачу
     asyncio.create_task(send_daily_memories(application))
 
-    # Запускаем polling с повторными попытками
-    max_retries = 5
-    retry_delay = 5
-
-    for attempt in range(max_retries):
-        try:
-            print(f"\n🔄 попытка {attempt + 1}/{max_retries}...")
-            print("✅ Бот успешно подключился!")
-            print("🚀 Бот запущен и готов к работе\n")
-            
-            application.run_polling(stop_signals=None)
-            break
+    # Запускаем polling (в v13.x нет параметра stop_signals)
+    print("🚀 Бот запущен и готов к работе\n")
+    application.run_polling()
 
         except Exception as e:
             print(f"❌ Ошибка: {e}")
