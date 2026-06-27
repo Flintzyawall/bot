@@ -1346,7 +1346,7 @@ def main():
             print("✅ Бот успешно подключился!")
             print("🚀 Бот запущен и готов к работе\n")
             
-            application.run_polling()
+            application.run_polling(stop_signals=None)
             break
 
         except Exception as e:
