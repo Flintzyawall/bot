@@ -2,7 +2,6 @@
 love_album_bot.py
 Единый файл Telegram-бота с поддержкой прокси и альтернативных серверов
 Адаптирован для Render.com с Flask-оберткой
-Переписан для python-telegram-bot v20.x
 """
 
 import asyncio
@@ -12,10 +11,11 @@ import logging
 import os
 import random
 import threading
+import time
 from datetime import datetime, timedelta
 
 # ==================== ИМПОРТЫ ДЛЯ PYTHON-TELEGRAM-BOT ====================
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto, InputMediaVideo
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
@@ -292,7 +292,7 @@ def save_uploaded_file(file_obj, category_key: str, original_ext: str) -> str:
     filename = f"upload_{timestamp}{original_ext}"
     filepath = os.path.join(folder, filename)
     
-    # В python-telegram-bot file_obj - это объект File
+    # В python-telegram-bot v13.x file_obj - это объект File
     file_obj.download(filepath)
     return filename
 
@@ -613,7 +613,7 @@ def love_calc_kb() -> InlineKeyboardMarkup:
 
 # Состояния для ConversationHandler
 CHOOSING_CATEGORY, ENTERING_CAPTION, ENTERING_MEMORY_DATE = range(3)
-AWAITING_AUDIO = range(3, 4)
+AWAITING_AUDIO = 3
 
 # Хранилище данных для FSM
 user_data_storage = {}
@@ -1328,27 +1328,15 @@ def main():
     application.add_handler(MessageHandler(filters.AUDIO | filters.VOICE, handle_audio))
 
     # Запускаем фоновую задачу
-    asyncio.create_task(send_daily_memories(application))
+    loop = asyncio.get_event_loop()
+    loop.create_task(send_daily_memories(application))
 
     # Запускаем polling (в v13.x нет параметра stop_signals)
     print("🚀 Бот запущен и готов к работе\n")
     application.run_polling()
 
-        except Exception as e:
-            print(f"❌ Ошибка: {e}")
-
-            if attempt < max_retries - 1:
-                print(f"⏳ Повтор через {retry_delay} секунд...")
-                time.sleep(retry_delay)
-            else:
-                print("\n" + "=" * 50)
-                print("❌ НЕ УДАЛОСЬ ПОДКЛЮЧИТЬСЯ К TELEGRAM API")
-                print("=" * 50)
-                raise
-
 
 if __name__ == "__main__":
-    import time
     try:
         # Запускаем веб-сервер в отдельном потоке для Render
         web_thread = threading.Thread(target=run_web_server, daemon=True)
