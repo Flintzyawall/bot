@@ -1,22 +1,23 @@
 """
 love_album_bot.py
 Единый файл Telegram-бота с поддержкой прокси и альтернативных серверов
+Адаптирован для Render.com с Flask-оберткой
 """
 
 import asyncio
+import html
+import json
 import logging
 import os
-import json
 import random
-import html
-import re
-import ssl
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,9 +26,31 @@ from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, InlineKeyboardMarkup,
     FSInputFile, InputMediaPhoto, InputMediaVideo
 )
-from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from dotenv import load_dotenv
+
+# ==================== ВЕБ-СЕРВЕР ДЛЯ RENDER ====================
+from flask import Flask, jsonify
+
+web_app = Flask(__name__)
+
+@web_app.route('/')
+def health_check():
+    return jsonify({
+        "status": "alive",
+        "bot": "Love Album Bot",
+        "version": "1.0"
+    })
+
+@web_app.route('/health')
+def health():
+    return jsonify({"status": "ok"})
+
+def run_web_server():
+    """Запускает веб-сервер для health checks на Render"""
+    port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 Веб-сервер запущен на порту {port}")
+    web_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
 # ==================== НАСТРОЙКИ ПОДКЛЮЧЕНИЯ ====================
 # Если у вас проблемы с доступом к Telegram API, измените эти настройки
@@ -60,7 +83,14 @@ DEFAULT_NAME = os.getenv("USER_NAME", "любимая")
 
 # Дата начала отношений для таймера и статистики (формат YYYY-MM-DD)
 # Поменяйте на свою дату через переменную окружения RELATIONSHIP_START_DATE
-RELATIONSHIP_START_DATE = os.getenv("RELATIONSHIP_START_DATE", "2024-01-01")
+RELATIONSHIP_START_DATE = os.getenv("RELATIONSHIP_START_DATE", "2025-05-03")
+
+# Время отправки утренних воспоминаний (в 24-часовом формате)
+MEMORY_TIME_HOUR = int(os.getenv("MEMORY_TIME_HOUR", "9"))
+MEMORY_TIME_MINUTE = int(os.getenv("MEMORY_TIME_MINUTE", "0"))
+
+# ID чата для отправки утренних воспоминаний (если не указан, будет использован ID последнего активного чата)
+MEMORY_CHAT_ID = os.getenv("MEMORY_CHAT_ID", None)
 
 # Пути к папкам
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +101,7 @@ CAPTIONS_FILE = os.path.join(DATA_DIR, "captions.json")
 FAVORITES_FILE = os.path.join(DATA_DIR, "favorites.json")
 MUSIC_FILE = os.path.join(DATA_DIR, "music.json")
 COMPLIMENTS_STATE_FILE = os.path.join(DATA_DIR, "compliments_state.json")
+MEMORY_DATES_FILE = os.path.join(DATA_DIR, "memory_dates.json")
 
 # Поддерживаемые расширения
 PHOTO_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
@@ -181,12 +212,16 @@ COMPLIMENTS = [
 
 EMPTY_FOLDER_TEXT = "Здесь пока пусто, но я обязательно это исправлю 💕"
 
+# Храним последний активный чат для отправки утренних воспоминаний
+last_active_chat_id = None
+
 
 # ==================== FSM СОСТОЯНИЯ ====================
 
 class UploadStates(StatesGroup):
     choosing_category = State()
     entering_caption = State()
+    entering_memory_date = State()
 
 
 class MusicStates(StatesGroup):
@@ -205,6 +240,7 @@ def ensure_folders() -> None:
         (FAVORITES_FILE, []),
         (MUSIC_FILE, {}),
         (COMPLIMENTS_STATE_FILE, {"used": []}),
+        (MEMORY_DATES_FILE, {}),
     )
     for filepath, default_value in defaults:
         if not os.path.exists(filepath):
@@ -260,13 +296,19 @@ def get_caption(category_key: str, filename: str, index: int, total: int) -> str
     else:
         title = f"Момент №{index + 1}"
 
+    # Проверяем, есть ли у файла дата воспоминания
+    memory_date = get_memory_date(category_key, filename)
+    date_str = ""
+    if memory_date:
+        date_str = f"\n📅 <i>Воспоминание на {memory_date.strftime('%d.%m.%Y')}</i>"
+
     safe_title = html.escape(title)
     safe_cat_title = html.escape(CATEGORIES[category_key]["title"])
     emoji = CATEGORIES[category_key]["emoji"]
 
     return (
         f"{emoji} <b>{safe_title}</b>\n"
-        f"<i>{safe_cat_title}</i>\n\n"
+        f"<i>{safe_cat_title}</i>{date_str}\n\n"
         f"Фото {index + 1} из {total}"
     )
 
@@ -292,6 +334,67 @@ async def save_uploaded_file(bot, file_id: str, category_key: str, original_ext:
 
     await bot.download(file_id, destination=filepath)
     return filename
+
+
+# ---------- Даты для воспоминаний ----------
+
+def _load_memory_dates() -> dict:
+    try:
+        with open(MEMORY_DATES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_memory_dates(dates: dict) -> None:
+    with open(MEMORY_DATES_FILE, "w", encoding="utf-8") as f:
+        json.dump(dates, f, ensure_ascii=False, indent=2)
+
+
+def set_memory_date(category_key: str, filename: str, date_obj: datetime.date) -> None:
+    """Установить дату для файла, чтобы он показывался в воспоминаниях"""
+    dates = _load_memory_dates()
+    key = f"{category_key}:{filename}"
+    dates[key] = date_obj.strftime("%Y-%m-%d")
+    _save_memory_dates(dates)
+
+
+def get_memory_date(category_key: str, filename: str) -> datetime.date:
+    """Получить дату воспоминания для файла"""
+    dates = _load_memory_dates()
+    key = f"{category_key}:{filename}"
+    date_str = dates.get(key)
+    if date_str:
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+    return None
+
+
+def remove_memory_date(category_key: str, filename: str) -> None:
+    """Удалить дату воспоминания для файла"""
+    dates = _load_memory_dates()
+    key = f"{category_key}:{filename}"
+    if key in dates:
+        del dates[key]
+        _save_memory_dates(dates)
+
+
+def get_memory_items_for_date(target_date: datetime.date) -> list:
+    """Получить все файлы с привязанной датой"""
+    result = []
+    for category_key, filename in get_all_media():
+        memory_date = get_memory_date(category_key, filename)
+        if memory_date and memory_date.month == target_date.month and memory_date.day == target_date.day:
+            result.append((category_key, filename))
+    return result
+
+
+def get_memory_items_for_today() -> list:
+    """Получить все воспоминания на сегодня"""
+    today = datetime.now().date()
+    return get_memory_items_for_date(today)
 
 
 # ---------- Избранное ----------
@@ -381,36 +484,6 @@ def _remove_music(category_key: str, filename: str) -> None:
     if key in data:
         del data[key]
         _save_music(data)
-
-
-# ---------- "Воспоминание дня" ----------
-
-_UPLOAD_NAME_RE = re.compile(r"^upload_(\d{8})_")
-
-
-def get_file_date(category_key: str, filename: str):
-    match = _UPLOAD_NAME_RE.match(filename)
-    if match:
-        try:
-            return datetime.strptime(match.group(1), "%Y%m%d").date()
-        except ValueError:
-            pass
-
-    filepath = os.path.join(CATEGORIES[category_key]["dir"], filename)
-    try:
-        return datetime.fromtimestamp(os.path.getmtime(filepath)).date()
-    except OSError:
-        return None
-
-
-def get_memory_items() -> list:
-    today = datetime.now().date()
-    result = []
-    for category_key, filename in get_all_media():
-        file_date = get_file_date(category_key, filename)
-        if file_date and file_date.month == today.month and file_date.day == today.day and file_date.year != today.year:
-            result.append((category_key, filename))
-    return result
 
 
 # ---------- Комплимент дня (без повторов, пока не закончатся все) ----------
@@ -535,6 +608,24 @@ def caption_choice_kb() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def memory_date_choice_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="📅 Сегодня", callback_data="memory:date:today")
+    builder.button(text="📅 Вчера", callback_data="memory:date:yesterday")
+    builder.button(text="✏️ Своя дата", callback_data="memory:date:custom")
+    builder.button(text="❌ Без даты", callback_data="memory:date:skip")
+    builder.adjust(2, 2)
+    return builder.as_markup()
+
+
+def memory_date_confirm_kb() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Подтвердить", callback_data="memory:confirm")
+    builder.button(text="❌ Отмена", callback_data="memory:cancel")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
 def minigame_menu_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="❤️ Насколько ты меня любишь?", callback_data="game:menu:love_scale")
@@ -574,7 +665,9 @@ router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
+    global last_active_chat_id
     await state.clear()
+    last_active_chat_id = message.chat.id
     name = message.from_user.first_name or DEFAULT_NAME
     text = (
         f"привет, {name}! 💕\n\n"
@@ -621,11 +714,18 @@ async def show_stats(message: Message):
     favorites_count = len(get_favorite_items())
     days = get_days_together()
 
+    # Считаем количество воспоминаний
+    memory_count = 0
+    for category_key, filename in all_items:
+        if get_memory_date(category_key, filename):
+            memory_count += 1
+
     text = (
         "📊 <b>Статистика альбома</b>\n\n"
         f"📸 Фотографий: {photos}\n"
         f"🎬 Видео: {videos}\n"
         f"⭐ Избранных моментов: {favorites_count}\n"
+        f"📅 Воспоминаний с датами: {memory_count}\n"
     )
     if days > 0:
         text += f"⏳ Мы вместе уже: {days} {_days_word(days)}\n"
@@ -637,11 +737,12 @@ async def show_stats(message: Message):
 
 @router.message(F.text == BTN_MEMORY)
 async def show_memory(message: Message):
-    items = get_memory_items()
+    items = get_memory_items_for_today()
     if not items:
         await message.answer(
-            "сегодня воспоминаний с прошлых лет пока не нашлось 💫\n"
-            "но они обязательно появятся просто продолжай добавлять моменты 💕"
+            "сегодня воспоминаний пока нет 💫\n"
+            "но ты можешь добавить дату к любому фото при загрузке, "
+            "и в этот день я пришлю его как воспоминание 💕"
         )
         return
     index = random.randrange(len(items))
@@ -667,7 +768,7 @@ def _get_list(category_key: str) -> list:
     if category_key == "fav":
         return get_favorite_items()
     if category_key == "memory":
-        return get_memory_items()
+        return get_memory_items_for_today()
     return [(category_key, filename) for filename in get_media_files(category_key)]
 
 
@@ -942,6 +1043,7 @@ async def handle_delete(callback: CallbackQuery):
         _remove_caption(filename)
         _remove_favorite(real_category, filename)
         _remove_music(real_category, filename)
+        remove_memory_date(real_category, filename)
 
         new_items = _get_list(list_key)
         if not new_items:
@@ -1050,6 +1152,9 @@ async def play_love_calc(callback: CallbackQuery):
 
 @router.message(StateFilter(None), F.photo | F.video)
 async def receive_media(message: Message, state: FSMContext):
+    global last_active_chat_id
+    last_active_chat_id = message.chat.id
+
     if message.photo:
         file_id = message.photo[-1].file_id
         ext = ".jpg"
@@ -1096,8 +1201,13 @@ async def choose_destination(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(UploadStates.entering_caption, F.data == "caption:skip")
 async def skip_caption(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("отлично, этот момент уже в альбоме 💕")
+    await state.set_state(UploadStates.entering_memory_date)
+    await callback.message.edit_text(
+        "отлично! теперь давай выберем дату для этого момента, "
+        "чтобы он показывался в воспоминаниях 📅\n\n"
+        "этот день будет особенным каждый год 💕",
+        reply_markup=memory_date_choice_kb(),
+    )
     await callback.answer()
 
 
@@ -1115,11 +1225,211 @@ async def save_custom_caption(message: Message, state: FSMContext):
     if filename:
         set_caption(filename, message.text)
 
-    await state.clear()
+    await state.set_state(UploadStates.entering_memory_date)
     await message.answer(
-        "подпись сохранена! теперь этот момент особенный 💖",
-        reply_markup=main_menu_kb(),
+        "подпись сохранена! теперь давай выберем дату для этого момента, "
+        "чтобы он показывался в воспоминаниях 📅\n\n"
+        "этот день будет особенным каждый год 💕",
+        reply_markup=memory_date_choice_kb(),
     )
+
+
+# ---------- ВЫБОР ДАТЫ ДЛЯ ВОСПОМИНАНИЯ ----------
+
+@router.callback_query(UploadStates.entering_memory_date, F.data.startswith("memory:date:"))
+async def choose_memory_date(callback: CallbackQuery, state: FSMContext):
+    action = callback.data.split(":")[2]
+
+    if action == "skip":
+        await state.clear()
+        await callback.message.edit_text("отлично! если захочешь добавить дату позже, просто нажми кнопку 'Изменить дату' под фото 💕")
+        await callback.answer()
+        return
+
+    if action == "today":
+        date_obj = datetime.now().date()
+        await state.update_data(memory_date=date_obj.strftime("%Y-%m-%d"))
+        await callback.message.edit_text(
+            f"✅ выбрана дата: <b>{date_obj.strftime('%d.%m.%Y')}</b> (сегодня)\n\n"
+            "в этот день каждый год я буду присылать это воспоминание 💕",
+            reply_markup=memory_date_confirm_kb(),
+        )
+
+    elif action == "yesterday":
+        date_obj = datetime.now().date() - timedelta(days=1)
+        await state.update_data(memory_date=date_obj.strftime("%Y-%m-%d"))
+        await callback.message.edit_text(
+            f"✅ выбрана дата: <b>{date_obj.strftime('%d.%m.%Y')}</b> (вчера)\n\n"
+            "в этот день каждый год я буду присылать это воспоминание 💕",
+            reply_markup=memory_date_confirm_kb(),
+        )
+
+    elif action == "custom":
+        await callback.message.edit_text(
+            "напиши дату в формате <b>ДД.ММ.ГГГГ</b> (например, 03.05.2025)\n\n"
+            "это будет день, когда я буду присылать это воспоминание каждый год 💕"
+        )
+        await callback.answer()
+        return
+
+    await callback.answer()
+
+
+@router.message(UploadStates.entering_memory_date, F.text)
+async def save_custom_memory_date(message: Message, state: FSMContext):
+    try:
+        date_obj = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+        await state.update_data(memory_date=date_obj.strftime("%Y-%m-%d"))
+        await message.answer(
+            f"✅ выбрана дата: <b>{date_obj.strftime('%d.%m.%Y')}</b>\n\n"
+            "в этот день каждый год я буду присылать это воспоминание 💕",
+            reply_markup=memory_date_confirm_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+    except ValueError:
+        await message.answer(
+            "❌ неверный формат даты!\n\n"
+            "пожалуйста, напиши дату в формате <b>ДД.ММ.ГГГГ</b>\n"
+            "например: <b>03.05.2025</b>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+@router.callback_query(UploadStates.entering_memory_date, F.data == "memory:confirm")
+async def confirm_memory_date(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    filename = data.get("saved_filename")
+    date_str = data.get("memory_date")
+
+    if filename and date_str:
+        date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+        # Определяем категорию по папке файла
+        category_key = None
+        for key, category in CATEGORIES.items():
+            if os.path.exists(os.path.join(category["dir"], filename)):
+                category_key = key
+                break
+
+        if category_key:
+            set_memory_date(category_key, filename, date_obj)
+
+    await state.clear()
+    await callback.message.edit_text(
+        "💕 отлично! теперь этот момент будет приходить к нам в этот день каждый год!\n\n"
+        "я буду присылать его утром, чтобы напомнить о прекрасном моменте ✨"
+    )
+    await callback.answer()
+
+
+@router.callback_query(UploadStates.entering_memory_date, F.data == "memory:cancel")
+async def cancel_memory_date(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("отлично, этот момент уже в альбоме 💕")
+    await callback.answer()
+
+
+# ---------- ИЗМЕНЕНИЕ ДАТЫ ВОСПОМИНАНИЯ ----------
+
+@router.callback_query(F.data.startswith("memory:edit:"))
+async def edit_memory_date(callback: CallbackQuery, state: FSMContext):
+    _, _, list_key, index_str = callback.data.split(":")
+    index = int(index_str)
+
+    items = _get_list(list_key)
+    if not items or index >= len(items):
+        await callback.answer("этот момент уже не найден", show_alert=True)
+        return
+
+    real_category, filename = items[index]
+    current_date = get_memory_date(real_category, filename)
+
+    await state.set_state(UploadStates.entering_memory_date)
+    await state.update_data(
+        saved_filename=filename,
+        editing=True,
+        list_key=list_key,
+        index=index
+    )
+
+    text = "✏️ выбери новую дату для этого воспоминания:\n\n"
+    if current_date:
+        text += f"текущая дата: <b>{current_date.strftime('%d.%m.%Y')}</b>\n\n"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=memory_date_choice_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer()
+
+
+# ==================== ФОНОВЫЕ ЗАДАЧИ ====================
+
+async def send_daily_memories(bot: Bot):
+    """Отправляет воспоминания каждый день в заданное время"""
+    global last_active_chat_id
+
+    while True:
+        now = datetime.now()
+        target_time = now.replace(hour=MEMORY_TIME_HOUR, minute=MEMORY_TIME_MINUTE, second=0, microsecond=0)
+
+        # Если время уже прошло сегодня, ждем до завтра
+        if now >= target_time:
+            target_time += timedelta(days=1)
+
+        wait_seconds = (target_time - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+
+        try:
+            # Получаем воспоминания на сегодня
+            memories = get_memory_items_for_today()
+
+            if not memories:
+                continue
+
+            # Определяем чат для отправки
+            chat_id = MEMORY_CHAT_ID or last_active_chat_id
+            if not chat_id:
+                continue
+
+            # Отправляем первое воспоминание с приветствием
+            await bot.send_message(
+                chat_id,
+                f"🌅 <b>Доброе утро, любимая!</b>\n\n"
+                f"сегодня особенный день, ведь ровно {len(memories)} год назад произошёл этот прекрасный момент ✨\n"
+                f"давай вспомним его вместе 💕",
+                parse_mode=ParseMode.HTML,
+            )
+
+            # Отправляем каждое воспоминание
+            for idx, (category_key, filename) in enumerate(memories, 1):
+                folder = CATEGORIES[category_key]["dir"]
+                filepath = os.path.join(folder, filename)
+
+                caption = get_caption(category_key, filename, idx, len(memories))
+                caption += f"\n\n📅 <i>Воспоминание на {datetime.now().strftime('%d.%m.%Y')}</i>"
+
+                file_input = FSInputFile(filepath)
+
+                if is_video(filename):
+                    await bot.send_video(chat_id, file_input, caption=caption, parse_mode=ParseMode.HTML)
+                else:
+                    await bot.send_photo(chat_id, file_input, caption=caption, parse_mode=ParseMode.HTML)
+
+                # Небольшая пауза между отправками
+                await asyncio.sleep(1)
+
+            # Финальное сообщение
+            await bot.send_message(
+                chat_id,
+                "💕 пусть эти воспоминания согревают тебя весь день!\n\n"
+                "ты - лучшее, что случилось в моей жизни ❤️",
+                parse_mode=ParseMode.HTML,
+            )
+
+        except Exception as e:
+            logging.error(f"Ошибка при отправке утренних воспоминаний: {e}")
+            await asyncio.sleep(60)  # При ошибке ждем минуту и пробуем снова
 
 
 # ==================== ЗАПУСК БОТА ====================
@@ -1147,6 +1457,7 @@ async def main():
     if PROXY:
         print(f"🔗 Прокси: {PROXY}")
     print(f"⏱ Таймаут: {TIMEOUT} сек")
+    print(f"⏰ Время отправки воспоминаний: {MEMORY_TIME_HOUR:02d}:{MEMORY_TIME_MINUTE:02d}")
     print("=" * 50)
 
     # Создаём папки
@@ -1166,6 +1477,9 @@ async def main():
     # Диспетчер
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+
+    # Запуск фоновой задачи для отправки утренних воспоминаний
+    asyncio.create_task(send_daily_memories(bot))
 
     # Запуск с повторными попытками
     max_retries = 5
@@ -1207,6 +1521,12 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        # Запускаем веб-сервер в отдельном потоке для Render
+        web_thread = threading.Thread(target=run_web_server, daemon=True)
+        web_thread.start()
+        print("🌐 Веб-сервер запущен в фоновом режиме")
+        
+        # Запускаем бота
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен пользователем.")
